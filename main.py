@@ -164,6 +164,12 @@ async def _run_agent(
                 ui_schema = output.get("ui_schema")
                 if ui_schema:
                     yield _sse("ui_schema", {"schema": ui_schema})
+                # Pipeline is complete — emit done immediately and exit.
+                # Do NOT wait for LangGraph's internal graph-wrapper events
+                # (e.g. on_chain_end for "LangGraph") which keep the async-for
+                # loop alive and delay — or permanently block — the done event.
+                yield _sse("done", {"message": "complete"})
+                return
 
             # ── Token streaming ───────────────────────────────────────────
             elif kind == "on_chat_model_stream":
