@@ -18,7 +18,7 @@ class Settings(BaseSettings):
 
     # MCP server (Ticket Management System)
     mcp_server_url: str = Field(
-        default="http://localhost:3000/api/mcp",
+        default="http://localhost:8001/mcp",
         description="HTTP URL of the MCP server endpoint",
     )
 
