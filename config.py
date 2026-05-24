@@ -3,7 +3,6 @@ Configuration management using pydantic-settings.
 Reads from environment variables / .env file.
 """
 
-from langchain_core import env
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
@@ -27,6 +26,20 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(
         default=["http://localhost:5173", "http://localhost:3000"],
         description="Allowed CORS origins",
+    )
+
+    # Session lifecycle (in-process store)
+    idle_timeout_seconds: int = Field(
+        default=1800,
+        description="Seconds of inactivity before a session is expired (default: 30 min)",
+    )
+    session_sweep_interval_seconds: int = Field(
+        default=300,
+        description="How often the background sweep evicts idle/closed sessions (default: 5 min)",
+    )
+    max_sessions: int = Field(
+        default=1000,
+        description="Safety cap on concurrent in-memory sessions; oldest evicted first",
     )
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_file_encoding="utf-8")
