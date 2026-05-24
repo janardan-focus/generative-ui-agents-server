@@ -8,6 +8,7 @@ FastAPI application that:
 
 SSE event types emitted
 -----------------------
+session         {"session_id": str}           — FIRST event; client stores and re-sends id
 agent_thinking  {"agent": str, "message": str}
 tool_selected   {"tool": str, "args": dict, "reasoning": str}
 tool_executing  {"tool": str}
@@ -21,21 +22,83 @@ error           {"message": str}
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 
 import uvicorn
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from langchain_core.messages import HumanMessage
 from sse_starlette.sse import EventSourceResponse
 
-from agents.graph import agent_graph
+import agents.graph as _agents_graph
+import sessions.store as _sessions_store
+from agents.graph import build_graph
 from config import settings
+from sessions.store import SessionRegistry, hash_api_key
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# App lifespan — wires saver, registry, graph, and background sweep
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: build checkpointer, registry, and compiled graph.
+    Shutdown: cancel background sweep task.
+
+    ⚠️  Single-worker constraint: sessions are process-sticky (in-process store).
+    Do NOT run uvicorn with --workers >1 or behind a round-robin load balancer
+    until the store is migrated to Redis/Mongo.  See CLAUDE.md §Session Management.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    # 1. Create the shared checkpointer (persists graph state per thread_id)
+    saver = InMemorySaver()
+
+    # 2. Create the session registry (lifecycle metadata + reference to saver)
+    registry = SessionRegistry(
+        saver=saver,
+        idle_timeout=settings.idle_timeout_seconds,
+        max_sessions=settings.max_sessions,
+    )
+    _sessions_store.registry = registry
+
+    # 3. Compile the graph with the checkpointer (done once, reused per request)
+    _agents_graph.agent_graph = build_graph(saver)
+    logger.info("[Lifespan] LangGraph compiled with InMemorySaver checkpointer")
+
+    # 4. Start background sweep task for memory hygiene
+    async def _sweep_loop() -> None:
+        while True:
+            await asyncio.sleep(settings.session_sweep_interval_seconds)
+            try:
+                await registry.sweep()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[Lifespan] Sweep error: %s", exc)
+
+    sweep_task = asyncio.create_task(_sweep_loop())
+    logger.info(
+        "[Lifespan] Session sweep started (interval=%ds)", settings.session_sweep_interval_seconds
+    )
+
+    yield  # ── server is running ──
+
+    # Shutdown
+    sweep_task.cancel()
+    try:
+        await sweep_task
+    except asyncio.CancelledError:
+        pass
+    logger.info("[Lifespan] Session sweep stopped")
+
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -45,6 +108,7 @@ app = FastAPI(
     title="Generative-UI Agent Server",
     description="LangGraph multi-agent pipeline with SSE streaming",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -73,15 +137,23 @@ async def _run_agent(
     query: str,
     mcp_api_key: str,
     mcp_server_url: str,
+    session_id: str,
 ) -> AsyncGenerator[dict[str, str], None]:
     """
     Runs the LangGraph agent pipeline and yields SSE events.
+
+    The session_id is passed as thread_id in the LangGraph config so the
+    InMemorySaver checkpointer restores prior turn state (messages, etc.).
 
     We use astream_events(version="v2") to get fine-grained lifecycle events:
       - on_chain_start / on_chain_end per node
       - on_chat_model_stream for token-level streaming
     """
-
+    # Seed the new turn with only the human message.  The add_messages reducer
+    # in AgentState will APPEND to the restored history — NOT replace it.
+    # We deliberately do NOT pass "messages": [] to avoid wiping the history.
+    # mcp_api_key / mcp_server_url are re-injected fresh from the request every
+    # turn so the raw key doesn't linger stale inside the checkpoint.
     initial_state = {
         "query": query,
         "tool_name": None,
@@ -89,11 +161,14 @@ async def _run_agent(
         "reasoning": "",
         "tool_result": None,
         "ui_schema": None,
-        "messages": [],
+        "messages": [HumanMessage(content=query)],
         "mcp_api_key": mcp_api_key,
         "mcp_server_url": mcp_server_url,
         "error": None,
     }
+
+    # thread_id binds this invocation to the session's checkpoint history
+    config = {"configurable": {"thread_id": session_id}}
 
     # Map node names to friendly labels
     agent_labels: dict[str, str] = {
@@ -102,11 +177,12 @@ async def _run_agent(
         "ui_renderer": "UIRenderer Agent",
     }
 
-    # Track which node is currently active for token attribution
     current_node: str = "orchestrator"
 
     try:
-        async for event in agent_graph.astream_events(initial_state, version="v2"):
+        async for event in _agents_graph.agent_graph.astream_events(
+            initial_state, config=config, version="v2"
+        ):
             kind: str = event["event"]
             name: str = event.get("name", "")
             metadata: dict = event.get("metadata", {})
@@ -136,7 +212,6 @@ async def _run_agent(
                     )
 
             elif kind == "on_chain_start" and name == "data_fetcher":
-                # Grab tool_name from the input snapshot if available
                 inp: dict = event["data"].get("input", {})
                 tool = inp.get("tool_name", "")
                 if tool:
@@ -146,7 +221,6 @@ async def _run_agent(
                 output = event["data"].get("output", {})
                 tool_result = output.get("tool_result")
                 if tool_result is not None:
-                    # Grab tool_name from graph state snapshot via input
                     inp = event["data"].get("input", {})
                     yield _sse(
                         "tool_result",
@@ -164,10 +238,10 @@ async def _run_agent(
                 ui_schema = output.get("ui_schema")
                 if ui_schema:
                     yield _sse("ui_schema", {"schema": ui_schema})
-                # Pipeline is complete — emit done immediately and exit.
-                # Do NOT wait for LangGraph's internal graph-wrapper events
-                # (e.g. on_chain_end for "LangGraph") which keep the async-for
-                # loop alive and delay — or permanently block — the done event.
+                # Pipeline complete — touch the session then signal done.
+                registry = _sessions_store.registry
+                if registry:
+                    await registry.touch(session_id)
                 yield _sse("done", {"message": "complete"})
                 return
 
@@ -215,15 +289,79 @@ async def chat_stream(
         default=settings.mcp_server_url,
         description="MCP server HTTP URL override",
     ),
+    session_id: str | None = Query(
+        default=None,
+        description=(
+            "Existing session ID to resume.  Omit (or pass an expired/unknown id) "
+            "to start a new session.  The server echoes the active session_id in the "
+            "first SSE 'session' event and the X-Session-Id response header."
+        ),
+    ),
 ) -> EventSourceResponse:
     """
     SSE endpoint consumed by the React AgentClient.
 
-    GET /chat/stream?query=<...>&api_key=<...>&mcp_url=<...>
+    GET /chat/stream?query=<...>&api_key=<...>[&session_id=<...>][&mcp_url=<...>]
+
+    Session handling
+    ----------------
+    1. If session_id is absent or the session is unknown/expired/closed, a new
+       session is minted and its id is returned.
+    2. The active session_id is emitted as the FIRST SSE event ('session') so
+       the EventSource client can read it (EventSource cannot read response headers).
+    3. The id is also set in the X-Session-Id response header as a convenience
+       for non-EventSource callers.
     """
-    return EventSourceResponse(
-        _run_agent(query=query, mcp_api_key=api_key, mcp_server_url=mcp_url)
+    registry = _sessions_store.registry
+    owner_hash = hash_api_key(api_key)
+
+    active_session_id, was_created = await registry.resolve_or_create(
+        session_id=session_id,
+        owner_hash=owner_hash,
     )
+
+    if was_created:
+        logger.info(
+            "[chat_stream] New session created session=%s (requested=%s)",
+            active_session_id,
+            session_id,
+        )
+    else:
+        logger.info("[chat_stream] Resuming session=%s", active_session_id)
+
+    async def _stream() -> AsyncGenerator[dict[str, str], None]:
+        # Always emit the session id as the very first event so the client
+        # can capture it regardless of whether it sent one in the request.
+        yield _sse("session", {"session_id": active_session_id})
+        async for evt in _run_agent(
+            query=query,
+            mcp_api_key=api_key,
+            mcp_server_url=mcp_url,
+            session_id=active_session_id,
+        ):
+            yield evt
+
+    return EventSourceResponse(
+        _stream(),
+        headers={"X-Session-Id": active_session_id},
+    )
+
+
+@app.post("/chat/session/{session_id}/close")
+async def close_session(session_id: str) -> JSONResponse:
+    """
+    Explicitly close a chat session.
+
+    Marks the session closed, removes it from the registry, and deletes its
+    LangGraph checkpoints (frees in-process memory immediately).
+
+    The React client should call this on 'New chat', chat-close, and via
+    navigator.sendBeacon inside the 'beforeunload' event handler.
+    """
+    registry = _sessions_store.registry
+    await registry.close(session_id)
+    logger.info("[close_session] Closed session=%s", session_id)
+    return JSONResponse({"status": "closed", "session_id": session_id})
 
 
 # ---------------------------------------------------------------------------
